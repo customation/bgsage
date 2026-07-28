@@ -1,5 +1,7 @@
 # C++ build artifacts
 build/
+build_capi/
+build_capi_linux/
 cmake-build-*/
 *.o
 *.obj
@@ -58,3 +60,4 @@ profile.*
 
 # Runtime output (xg transcripts, rollout caches, training logs, etc.)
 logs/
+build_capi_msvc/
