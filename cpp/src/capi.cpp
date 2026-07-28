@@ -340,6 +340,13 @@ float compute_cubeful_nply(const Board& post_move_board, const CubeInfo& ci,
                                 n_plies, filter, /*n_threads=*/1);
 }
 
+// Thread count for the standalone cubeful analytics entries. The capi config
+// documents `threads` as 0 = auto, which the strategy constructors resolve
+// themselves; these entries take a concrete count instead, so 0 means serial.
+int analytics_threads(const bgsage_engine* engine) {
+    return engine->threads > 0 ? engine->threads : 1;
+}
+
 int fill_moves(const std::vector<Scored>& scored, bgsage_move* out,
                int max_moves, int* n_out) {
     const int count = std::min<int>((int)scored.size(), max_moves);
@@ -386,10 +393,16 @@ int bgsage_checker_play(
             // multi-ply inner, use_cube_aware_probs branch): EVERY candidate's
             // probs, cubeless AND cubeful equity come from ONE cube-aware
             // N-ply traversal of its flipped (opponent pre-roll) node —
-            // cubeful_probs_and_equity_nply, single-threaded per candidate —
-            // then sort by cubeful. The cubeless inner analyzer's survivor
-            // filtering only fills fields this overwrite replaces, so it
-            // drops out of the observable result.
+            // cubeful_probs_and_equity_nply — then sort by cubeful. The
+            // cubeless inner analyzer's survivor filtering only fills fields
+            // this overwrite replaces, so it drops out of the observable
+            // result.
+            //
+            // The traversal spreads its 21 top-level rolls over the shared
+            // multipy pool (cube_eval.cpp enables that only at n_plies > 2).
+            // Parity is unaffected: rolls accumulate into arCf in fixed index
+            // order whatever the thread count, so the equities are identical
+            // to the serial walk — this is throughput only.
             CubeInfo opp_ci = call.ci;
             if (opp_ci.owner == CubeOwner::PLAYER) opp_ci.owner = CubeOwner::OPPONENT;
             else if (opp_ci.owner == CubeOwner::OPPONENT) opp_ci.owner = CubeOwner::PLAYER;
@@ -400,7 +413,7 @@ int bgsage_checker_play(
             for (const Board& candidate : candidates) {
                 auto r = cubeful_probs_and_equity_nply(
                     flip(candidate), opp_ci, *engine->base_eval, engine->n_plies,
-                    engine->filter, /*n_threads=*/1);
+                    engine->filter, analytics_threads(engine));
                 Scored entry;
                 entry.board = candidate;
                 entry.probs = inverted(r.probs);
@@ -493,7 +506,7 @@ int bgsage_post_move(
             std::swap(opp_ci.match.away1, opp_ci.match.away2);
             auto opp_probs = cubeful_probs_nply(
                 opp_pre_roll, opp_ci, *engine->base_eval, engine->n_plies,
-                engine->filter, engine->threads > 0 ? engine->threads : 1);
+                engine->filter, analytics_threads(engine));
             probs = inverted(opp_probs);
             clear_cubeful_eval_cache();
         } else {
@@ -641,7 +654,7 @@ int bgsage_cube_action(
             // action near thresholds) diverge from the analyzer's.
             static PubEval pubeval_filter;
             cd = cube_decision_nply(board, ci, *engine->base_eval, engine->n_plies,
-                                    engine->filter, engine->threads > 0 ? engine->threads : 1,
+                                    engine->filter, analytics_threads(engine),
                                     &pubeval_filter);
             // Pre-roll probs at N-ply for the report, matching the unified
             // binding's temporary MultiPlyStrategy usage.
