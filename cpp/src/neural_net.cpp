@@ -119,6 +119,94 @@ static inline __m256 sigmoid256_ps(__m256 x) {
 }
 #endif
 
+// ======================== NEON Vectorized Sigmoid ========================
+// The same Cephes approximation as sigmoid256_ps, operation for operation.
+//
+// This exists because without it ARM had no vectorized sigmoid at all, so the
+// hidden-layer loop below fell through to fast_sigmoid() for EVERY unit while
+// x86 used the polynomial. The LUT's documented error is < 1e-5 per unit; across
+// the hidden layers of 19 networks that accumulated to 3.9e-4 on the starting
+// position -- ARM evaluated it at WinProb 0.5272137 where x86 gave 0.5276, and
+// bit-identically so on Linux/gcc and macOS/clang alike, because it was never
+// floating-point noise. It was a different function.
+//
+// Faithfulness is the whole point, so nothing here is "improved":
+//   * Operation order matches exactly. FMA is exactly specified by IEEE-754, as
+//     are floor, mul, sub, add and div, so the same sequence on the same floats
+//     gives the same bits. Note the operand order differs between the two ISAs
+//     -- _mm256_fmadd_ps(a,b,c) is a*b+c, while vfmaq_f32(a,b,c) is a+b*c --
+//     which is the easiest thing to get quietly wrong here.
+//   * -x is written as 0-x rather than vnegq_f32, mirroring the AVX2 line. Only
+//     the sign of zero differs and exp(±0) is 1 either way, but a deliberate
+//     mirror is worth more than a micro-optimisation on a function whose only
+//     job is to agree.
+//   * Every call site steps by EIGHT even though this is a 4-wide function, so
+//     that the remainder handed to fast_sigmoid() is the same remainder AVX2
+//     hands it. A 4-wide loop is the obvious way to write it and is wrong:
+//     PureRace has 100 hidden units, so AVX2 runs 96 through the polynomial and
+//     the last 4 through the LUT, while a 4-wide loop would run all 100 through
+//     the polynomial -- reintroducing this exact bug in a smaller and much
+//     harder-to-find form. (Contact nets are 400 units and have no remainder,
+//     which is precisely why such a mistake would hide.)
+#if defined(BGBOT_USE_NEON)
+static inline float32x4_t exp_ps_neon(float32x4_t x) {
+    const float32x4_t one    = vdupq_n_f32(1.0f);
+    const float32x4_t half   = vdupq_n_f32(0.5f);
+    const float32x4_t exp_hi = vdupq_n_f32(88.3762626647949f);
+    const float32x4_t exp_lo = vdupq_n_f32(-88.3762626647949f);
+    const float32x4_t log2e  = vdupq_n_f32(1.44269504088896341f);
+    const float32x4_t c1     = vdupq_n_f32(0.693359375f);
+    const float32x4_t c2     = vdupq_n_f32(-2.12194440e-4f);
+    const float32x4_t p0     = vdupq_n_f32(1.9875691500E-4f);
+    const float32x4_t p1     = vdupq_n_f32(1.3981999507E-3f);
+    const float32x4_t p2     = vdupq_n_f32(8.3334519073E-3f);
+    const float32x4_t p3     = vdupq_n_f32(4.1665795894E-2f);
+    const float32x4_t p4     = vdupq_n_f32(1.6666665459E-1f);
+    const float32x4_t p5     = vdupq_n_f32(5.0000001201E-1f);
+
+    // Clamp input
+    x = vminq_f32(x, exp_hi);
+    x = vmaxq_f32(x, exp_lo);
+
+    // exp(x) = 2^n * exp(f) where f = x - n*ln(2) and n = floor(x/ln(2) + 0.5)
+    float32x4_t fx = vfmaq_f32(half, x, log2e);   // x*log2e + half
+    fx = vrndmq_f32(fx);                          // floor (ARMv8-A)
+
+    // Reduce: x = x - fx * ln(2) (two-step for precision)
+    float32x4_t tmp = vmulq_f32(fx, c1);
+    float32x4_t z   = vmulq_f32(fx, c2);
+    x = vsubq_f32(x, tmp);
+    x = vsubq_f32(x, z);
+    z = vmulq_f32(x, x);
+
+    // Horner polynomial evaluation
+    float32x4_t y = vfmaq_f32(p1, p0, x);   // p0*x + p1
+    y = vfmaq_f32(p2, y, x);
+    y = vfmaq_f32(p3, y, x);
+    y = vfmaq_f32(p4, y, x);
+    y = vfmaq_f32(p5, y, x);
+    y = vfmaq_f32(x, y, z);                 // y*z + x
+    y = vaddq_f32(y, one);
+
+    // Scale by 2^n: convert n to integer, shift into exponent bits.
+    // vcvtq_s32_f32 truncates toward zero, matching _mm256_cvttps_epi32.
+    int32x4_t imm0 = vcvtq_s32_f32(fx);
+    imm0 = vaddq_s32(imm0, vdupq_n_s32(0x7f));
+    imm0 = vshlq_n_s32(imm0, 23);
+    float32x4_t pow2n = vreinterpretq_f32_s32(imm0);
+
+    return vmulq_f32(y, pow2n);
+}
+
+static inline float32x4_t sigmoid_ps_neon(float32x4_t x) {
+    const float32x4_t one  = vdupq_n_f32(1.0f);
+    const float32x4_t zero = vdupq_n_f32(0.0f);
+    float32x4_t neg_x = vsubq_f32(zero, x);
+    float32x4_t exp_neg_x = exp_ps_neon(neg_x);
+    return vdivq_f32(one, vaddq_f32(one, exp_neg_x));
+}
+#endif
+
 // SIMD dot product: compute sum of a[i]*b[i] for i=0..n-1
 // Both a and b must be at least n floats. No alignment required.
 #ifdef _MSC_VER
@@ -343,6 +431,13 @@ std::array<float, NN_OUTPUTS> NeuralNetwork::forward(const float* inputs) const 
             __m256 v = _mm256_loadu_ps(&hiddens[h]);
             _mm256_storeu_ps(&hiddens[h], sigmoid256_ps(v));
         }
+#elif defined(BGBOT_USE_NEON)
+        // Two 4-wide stores per iteration rather than a 4-wide loop, so the
+        // tail left to fast_sigmoid() below is the SAME tail AVX2 leaves.
+        for (; h + 7 < nh; h += 8) {
+            vst1q_f32(&hiddens[h],     sigmoid_ps_neon(vld1q_f32(&hiddens[h])));
+            vst1q_f32(&hiddens[h + 4], sigmoid_ps_neon(vld1q_f32(&hiddens[h + 4])));
+        }
 #endif
         for (; h < nh; ++h) {
             hiddens[h] = fast_sigmoid(hiddens[h]);
@@ -539,6 +634,13 @@ void NeuralNetwork::forward_batch(
                 __m256 v = _mm256_loadu_ps(&hiddens[h]);
                 _mm256_storeu_ps(&hiddens[h], sigmoid256_ps(v));
             }
+#elif defined(BGBOT_USE_NEON)
+            // Two 4-wide stores per iteration rather than a 4-wide loop, so the
+            // tail left to fast_sigmoid() below is the SAME tail AVX2 leaves.
+            for (; h + 7 < nh; h += 8) {
+                vst1q_f32(&hiddens[h],     sigmoid_ps_neon(vld1q_f32(&hiddens[h])));
+                vst1q_f32(&hiddens[h + 4], sigmoid_ps_neon(vld1q_f32(&hiddens[h + 4])));
+            }
 #endif
             for (; h < nh; ++h) {
                 hiddens[h] = fast_sigmoid(hiddens[h]);
@@ -712,6 +814,13 @@ std::array<float, NN_OUTPUTS> NeuralNetwork::forward_save_base(
             __m256 v = _mm256_loadu_ps(&hiddens[h]);
             _mm256_storeu_ps(&hiddens[h], sigmoid256_ps(v));
         }
+#elif defined(BGBOT_USE_NEON)
+        // Two 4-wide stores per iteration rather than a 4-wide loop, so the
+        // tail left to fast_sigmoid() below is the SAME tail AVX2 leaves.
+        for (; h + 7 < nh; h += 8) {
+            vst1q_f32(&hiddens[h],     sigmoid_ps_neon(vld1q_f32(&hiddens[h])));
+            vst1q_f32(&hiddens[h + 4], sigmoid_ps_neon(vld1q_f32(&hiddens[h + 4])));
+        }
 #endif
         for (; h < nh; ++h) {
             hiddens[h] = fast_sigmoid(hiddens[h]);
@@ -883,6 +992,13 @@ std::array<float, NN_OUTPUTS> NeuralNetwork::forward_from_base(
         for (; h + 7 < nh; h += 8) {
             __m256 v = _mm256_loadu_ps(&hiddens[h]);
             _mm256_storeu_ps(&hiddens[h], sigmoid256_ps(v));
+        }
+#elif defined(BGBOT_USE_NEON)
+        // Two 4-wide stores per iteration rather than a 4-wide loop, so the
+        // tail left to fast_sigmoid() below is the SAME tail AVX2 leaves.
+        for (; h + 7 < nh; h += 8) {
+            vst1q_f32(&hiddens[h],     sigmoid_ps_neon(vld1q_f32(&hiddens[h])));
+            vst1q_f32(&hiddens[h + 4], sigmoid_ps_neon(vld1q_f32(&hiddens[h + 4])));
         }
 #endif
         for (; h < nh; ++h) {
